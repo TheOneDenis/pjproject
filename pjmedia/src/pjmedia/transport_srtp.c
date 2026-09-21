@@ -349,6 +349,13 @@ typedef struct transport_srtp
 
     pj_uint32_t          tx_ssrc;
 
+    /* RX ROC retry state: retry with the alternative ROC candidate only
+     * while no packet has authenticated yet; _alt tells which candidate
+     * (FALSE: rx_roc, TRUE: prev_rx_roc) is currently applied.
+     */
+    pj_bool_t             rx_roc_retry;
+    pj_bool_t             rx_roc_retry_alt;
+
 } transport_srtp;
 
 
@@ -1078,6 +1085,13 @@ static pj_status_t create_srtp_ctx(transport_srtp *srtp,
         status = PJMEDIA_ERRNO_FROM_LIBSRTP(err);
         goto on_return;
     }
+    if (ctx == &srtp->srtp_ctx) {
+        /* Open the ROC retry window for the RTP stream; the RTCP context
+         * may be created later and must not reset it.
+         */
+        srtp->rx_roc_retry = PJ_TRUE;
+        srtp->rx_roc_retry_alt = PJ_FALSE;
+    }
     if (setting->rx_roc.roc != 0 &&
         setting->rx_roc.ssrc != 0)
     {
@@ -1653,6 +1667,12 @@ static void srtp_rtp_cb(pjmedia_tp_cb_param *param)
         return;
     }
 
+    /* Runt packets cannot hold an RTP header. */
+    if (size < (pj_ssize_t)sizeof(pjmedia_rtp_hdr)) {
+        PJ_LOG(4, (srtp->pool->obj_name, "Runt RTP packet, size=%ld", size));
+        return;
+    }
+
     /* Give the packet to keying first by invoking its send_rtp() op.
      * Yes, the usage of send_rtp() is rather hacky, but it is convenient
      * as the signature suits the purpose and it is ready to use
@@ -1751,6 +1771,7 @@ static void srtp_rtp_cb(pjmedia_tp_cb_param *param)
 
 #if PJMEDIA_SRTP_CHECK_ROC_ON_RESTART
     if (srtp->probation_cnt > 0 && err == srtp_err_status_auth_fail &&
+        srtp->rx_roc_retry &&
         srtp->setting.prev_rx_roc.ssrc != 0 &&
         srtp->setting.prev_rx_roc.ssrc == srtp->setting.rx_roc.ssrc &&
         srtp->setting.prev_rx_roc.roc != srtp->setting.rx_roc.roc)
@@ -1790,28 +1811,38 @@ static void srtp_rtp_cb(pjmedia_tp_cb_param *param)
         }
 
     } else if (need_retry) {
-        unsigned roc, new_roc;
+        unsigned old_roc, new_roc;
         srtp_err_status_t status;
 
-        srtp_get_stream_roc(srtp->srtp_ctx.srtp_rx_ctx,
-                            srtp->setting.rx_roc.ssrc, &roc);
-        new_roc = (roc == srtp->setting.rx_roc.roc?
-                   srtp->setting.prev_rx_roc.roc: srtp->setting.rx_roc.roc);
+        /* Alternate the ROC candidate on each retry, only while no
+         * packet has authenticated yet.
+         */
+        old_roc = (srtp->rx_roc_retry_alt? srtp->setting.prev_rx_roc.roc :
+                   srtp->setting.rx_roc.roc);
+        new_roc = (srtp->rx_roc_retry_alt? srtp->setting.rx_roc.roc :
+                   srtp->setting.prev_rx_roc.roc);
         status = srtp_set_stream_roc(srtp->srtp_ctx.srtp_rx_ctx,
                                      srtp->setting.rx_roc.ssrc, new_roc);
         if (status == srtp_err_status_ok) {
+            srtp->rx_roc_retry_alt = !srtp->rx_roc_retry_alt;
             PJ_LOG(4, (srtp->pool->obj_name,
                        "Retrying to unprotect SRTP from ROC %d to new ROC %d",
-                       roc, new_roc));
+                       old_roc, new_roc));
             err = srtp_unprotect(srtp->srtp_ctx.srtp_rx_ctx, (pj_uint8_t*)pkt,
                                  &len);
+        } else {
+            PJ_LOG(4, (srtp->pool->obj_name,
+                       "Failed to set RX ROC %d for retry, err=%s",
+                       new_roc, get_libsrtp_errstr(status)));
         }
     }
 
     if (err != srtp_err_status_ok) {
         PJ_LOG(5,(srtp->pool->obj_name,
-                  "Failed to unprotect SRTP, pkt size=%ld, SSRC=%u, err=%s",
-                  size, rx_ssrc, get_libsrtp_errstr(err)));
+                  "Failed to unprotect SRTP, pkt size=%ld, SSRC=%u, "
+                  "seq=%u, err=%s",
+                  size, rx_ssrc, ntohs(((pjmedia_rtp_hdr*)pkt)->seq),
+                  get_libsrtp_errstr(err)));
     } else {
         cb = srtp->rtp_cb;
         cb2 = srtp->rtp_cb2;
@@ -1822,6 +1853,9 @@ static void srtp_rtp_cb(pjmedia_tp_cb_param *param)
 
         /* Save SSRC after successful SRTP unprotect */
         srtp->rx_ssrc = rx_ssrc;
+
+        /* Stop ROC retries, the stream has authenticated. */
+        srtp->rx_roc_retry = PJ_FALSE;
     }
 
     pj_lock_release(srtp->mutex);
